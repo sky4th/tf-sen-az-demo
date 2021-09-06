@@ -1,0 +1,149 @@
+# Azure pipeline to deploy landing zone
+
+trigger:
+  batch: true
+  branches:
+    include:
+    - develop
+  paths:
+    exclude:
+    - readme.md
+
+#-- Parameters
+parameters:
+
+- name: 'tf_version'  # defaults for any parameters that aren't specified
+  type: string
+  default: '1.0.0'
+- name: 'tf_sub'  # defaults for any parameters that aren't specified
+  type: string
+  default: 'UKDDC_Azure_Subscription'
+- name: 'backend_rg'  # defaults for any parameters that aren't specified
+  type: string
+  default: 'priyag-sandbox-rg'
+- name: 'backend_storageaccount'  # defaults for any parameters that aren't specified
+  type: string
+  default: 'pocterraformstatefile'
+- name: 'backend_container'  # defaults for any parameters that aren't specified
+  type: string
+  default: 'statefile'
+- name: 'run_apply'  # defaults for any parameters that aren't specified
+  type: string
+  default: 'false'
+- name: 'run_destroy'  # defaults for any parameters that aren't specified
+  type: string
+  default: 'true'
+
+stages:
+
+- stage: Deploy_Terraform
+  displayName: Deploy_Terraform
+  jobs:
+  - job: Terraform_Deploy_Terraform
+    displayName: Terraform_Deploy_Terraform
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      # Instaling terraform
+    - task: TerraformInstaller@0
+      displayName: Install Terraform
+      inputs:
+        terraformVersion: ${{ parameters.tf_version }}
+
+    # Validate the terraform version
+    - script: |
+          terraform version
+      displayName: Check Terraform Version
+
+    - task: AzureCLI@2
+      displayName: Whitelist Hosted Agent IP
+      inputs:
+        azureSubscription: ${{ parameters['tf_sub'] }}
+        backendAzureRmResourceGroupName: ${{ parameters['backend_rg'] }}
+        backendAzureRmStorageAccountName: ${{ parameters['backend_storageaccount'] }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        failOnStandardError: true
+        inlineScript: |
+          export API_URL="https://api.ipify.org"
+          export HOST_IP="$(curl -s https://api.ipify.org)"
+          echo "IP of Hosted Agent is: $HOST_IP"
+          echo "Resource Group: ${{ parameters['backend_rg'] }}"
+          echo "Storage Account: ${{ parameters['backend_storageaccount'] }}"
+          az storage account network-rule add --resource-group ${{ parameters['backend_rg'] }} --account-name ${{ parameters['backend_storageaccount'] }} --ip-address ${HOST_IP}
+          sleep 30
+
+    # Initialise Terraform and backend
+    - task: TerraformTaskV2@2
+      displayName: Initialise Terraform and Backend
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        commandOptions: -reconfigure -force-copy -upgrade -input=false
+        backendServiceArm: ${{ parameters['tf_sub'] }}
+        backendAzureRmResourceGroupName: ${{ parameters['backend_rg'] }}
+        backendAzureRmStorageAccountName: ${{ parameters['backend_storageaccount'] }}
+        backendAzureRmContainerName: ${{ parameters['backend_container'] }}
+        backendAzureRmKey: backend.tfstate
+
+    # Terraform Validate
+    - task: TerraformTaskV2@2
+      displayName: Validate Terraform
+      inputs:
+        provider: 'azurerm'
+        command: 'validate'
+        displayName: Terraform Validate
+        workingDirectory: $(System.DefaultWorkingDirectory)
+
+    # Terraform plan
+    - task: TerraformTaskV2@2
+      displayName: Run Terraform Plan
+      condition: succeeded()
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        commandOptions: '-var-file="./config/global.tfvars"'
+        displayName: Terraform Plan
+        environmentServiceNameAzureRM: ${{ parameters['tf_sub'] }}
+        workingDirectory: $(System.DefaultWorkingDirectory)
+
+    # Terraform apply
+    - task: TerraformTaskV2@2
+      displayName: Run Terraform Apply
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        commandOptions: '-var-file="./config/global.tfvars"'
+        displayName: Terraform Plan
+        environmentServiceNameAzureRM: ${{ parameters['tf_sub'] }}
+        workingDirectory: $(System.DefaultWorkingDirectory)
+      condition: and(succeeded(), eq(${{ parameters['run_apply'] }}, 'true'))
+
+    # Terraform destroy
+    - task: TerraformTaskV2@2
+      displayName: Run Terraform Destroy
+      inputs:
+        provider: 'azurerm'
+        command: 'destroy'
+        commandOptions: '-var-file="./config/global.tfvars"'
+        environmentServiceNameAzureRM: ${{ parameters['tf_sub'] }}
+        workingDirectory: $(System.DefaultWorkingDirectory)
+      condition: and(always(), eq(${{ parameters['run_destroy'] }}, 'true'))
+
+    ## Remove Agent IP from Storage Account Firewall
+    - task: AzureCLI@2
+      displayName: Remove Hosted Agent IP
+      condition: succeeded()
+      inputs:
+        azureSubscription: ${{ parameters['tf_sub'] }}
+        backendAzureRmResourceGroupName: ${{ parameters['backend_rg'] }}
+        backendAzureRmStorageAccountName: ${{ parameters['backend_storageaccount'] }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        failOnStandardError: true
+        inlineScript: |
+          az account show
+          export API_URL="https://api.ipify.org"
+          export HOST_IP="$(curl -s https://api.ipify.org)"
+          echo "IP of Hosted Agent is: $HOST_IP"
+          az storage account network-rule remove --resource-group  ${{ parameters['backend_rg'] }} --account-name ${{ parameters['backend_storageaccount'] }} --ip-address ${HOST_IP}
